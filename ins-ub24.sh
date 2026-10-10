@@ -148,6 +148,38 @@ python3 -m pip install \
   "SpeechRecognition>=3.10.0" "pydub>=0.25.0" "numpy>=1.24.0"
 
 # ------------------------------------------------------------
+# 7.5 SeleniumBase 兼容层 —— proot 下 chromedriver 收到 /session 就 SIGSEGV
+#     (Chrome 本身没问题, DrissionPage 走纯 CDP 完全正常)
+#     装好后 `from seleniumbase import SB` 自动走 DrissionPage 后端, 脚本无需改
+# ------------------------------------------------------------
+log "6.5/8 安装 SeleniumBase 兼容层 (DrissionPage 后端)..."
+SHIM_DIR="$APP/shim/seleniumbase"
+mkdir -p "$SHIM_DIR"
+SHIM_SRC="$(cd "$(dirname "$0")" && pwd)/shim/seleniumbase/__init__.py"
+if [ -f "$SHIM_SRC" ]; then
+  cp "$SHIM_SRC" "$SHIM_DIR/__init__.py"
+  log "兼容层已装: $SHIM_DIR/__init__.py"
+else
+  warn "找不到 $SHIM_SRC —— 请把 shim/ 目录和本脚本放一起再跑"
+fi
+
+# 让任何 python 进程都优先加载兼容层。
+# 用 .pth 而不是 sitecustomize: sitecustomize 只会加载 sys.path 上第一个,
+# 通常是 /usr/lib/python3.X/sitecustomize.py (Ubuntu 的 apport 钩子),
+# 写在 dist-packages 里的会被静默屏蔽。.pth 每个 site 目录都会被处理, 不会被屏蔽。
+PYSITE="$(python3 -c 'import site;print(site.getsitepackages()[0])' 2>/dev/null)"
+if [ -n "$PYSITE" ] && [ -d "$PYSITE" ]; then
+  cat >"$PYSITE/bp-shim.pth" <<EOF
+import os,sys; sys.path.insert(0,"$APP/shim") if (os.path.isdir("$APP/shim") and not os.environ.get("BP_NO_SHIM")) else None
+EOF
+  log "已装 .pth: $PYSITE/bp-shim.pth"
+  # 清掉早期版本误写的 sitecustomize（会被系统那个屏蔽，留着只会误导）
+  rm -f "$PYSITE/sitecustomize.py" 2>/dev/null || true
+else
+  warn "找不到 site-packages 目录，兼容层可能不会被自动加载"
+fi
+
+# ------------------------------------------------------------
 # 8. 工作区 —— 关键: 实测可写，不信权限位
 # ------------------------------------------------------------
 log "7/8 准备浏览器工作区..."
@@ -207,6 +239,9 @@ BROWSER_HOME=$BROWSER_HOME
 BROWSER_WORK_DIR=$BROWSER_WORK
 BROWSER_XAUTHORITY=$XAUTH
 BROWSER_USER_DATA_DIR=$BROWSER_WORK/persistent
+# SeleniumBase 兼容层: 让 `from seleniumbase import SB` 走 DrissionPage 后端
+# (proot 下 chromedriver 会 SIGSEGV, 详见 README「0. Chrome 脚本跑不起来」)
+PYTHONPATH=$APP/shim:$APP/shim/pylibs
 # PRoot: 让 browser-launcher.js 跳过降权（该补丁已内置在 launcher 里）
 PROOT_ENV=1
 PROOT_NO_SECCOMP=1
@@ -225,6 +260,7 @@ export DISPLAY=$DISPLAY_NUM
 export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 export BROWSER_CHROME_PATH=$CHROME_PATH
 export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=$CHROME_PATH
+export PYTHONPATH=$APP/shim\${PYTHONPATH:+:\$PYTHONPATH}
 EOF
 chmod 644 /etc/profile.d/browser-panel.sh
 
