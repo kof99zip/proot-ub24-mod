@@ -254,28 +254,38 @@ touch /var/log/nginx/access.log /var/log/nginx/error.log
 > 只是它跑得晚 —— 你的命令在它之前就失败了。
 
 ```bash
-# 1. 装依赖 + SeleniumBase 兼容层
+# 进 proot 后第一件事
+# 修 apt
+curl -o /root/fix-apt.sh https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/fix-apt.sh && chmod +x fix-apt.sh && bash fix-apt.sh
+
+# 然后装必要app
+echo "127.0.0.1 localhost" > /etc/hosts && apt update && apt install -y curl wget nano sudo bash nginx
+
+# 安装并修复web：
+curl -o /root/install-web.sh https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/install-web.sh && chmod +x /root/install-web.sh && bash /root/install-web.sh
+
+# 装依赖 + SeleniumBase 兼容层
 #    注意: shim/ 目录必须和 ins-ub24.sh 放一起(仓库里保持这个层级)
 curl -o /root/ins-ub24.sh -Ls https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/ins-ub24.sh
 curl -o /root/shim-seleniumbase.py -Ls https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/shim/seleniumbase/__init__.py
 mkdir -p /root/shim/seleniumbase && mv /root/shim-seleniumbase.py /root/shim/seleniumbase/__init__.py
 bash /root/ins-ub24.sh
 
-# 2. 装面板（用你 proot-ub24 里那份原版 bp.sh 即可）
-curl -o /root/bp.sh -Ls https://raw.githubusercontent.com/kuisa/proot-ub24/main/bp.sh
+# 装面板（用你 proot-ub24 里那份原版 bp.sh 即可）
+curl -o /root/bp.sh -Ls https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/bp.sh
 bash /root/bp.sh
 
-# 3. 放 launcher（已内置 proot 补丁）
+# 放 launcher（已内置 proot 补丁）
 mkdir -p /opt/browser-panel/server/runtime
 curl -fLs https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/browser-launcher.js \
   -o /opt/browser-panel/server/runtime/browser-launcher.js
 
-# 4. 启动
+# 启动
 curl -o /root/panel.sh -Ls https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/panel.sh
-sh /root/panel.sh
-sh /root/panel.sh status
+bash /root/panel.sh
+bash /root/panel.sh status
 
-# 5. 验证 Chrome 脚本能跑（关键一步）
+# 验证 Chrome 脚本能跑（关键一步）
 python3 -c "from seleniumbase import SB; import seleniumbase; print(seleniumbase.__version__)"
 #   应输出 sbshim-1.0.0；若输出 4.x.x 说明兼容层没加载上
 ```
