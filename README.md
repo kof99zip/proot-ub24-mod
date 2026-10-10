@@ -158,11 +158,24 @@ if touch "$BROWSER_WORK/.wtest" 2>/dev/null; then ... fi
 
 `ins-ub24.sh` 装完会实测一次，并且 **chown 之后再测一次**。
 
-### 3. chown 之后的二次确认
+### 3. proot 下不要 chown —— 会把工作区锁死
 
-Alpine 那台上踩过：面板启动时 `chown -R browser` 把工作区变成 `1000:1000`，之后**谁也改不回来**（`chmod` 被伪造、`su browser` 也删不掉自己的文件）。
+**症状**：`ins-ub24.sh` 装完时工作区还是可写的，过一会儿（面板第一次跑）就变成 `1000:1000`，之后**永久不可写**。
 
-`ins-ub24.sh` 会在 chown 之后复测；一旦发现变不可写，直接提示改用 `BROWSER_USER=root`。
+**后果比想象的严重**：不光写不进去，**连 `rm -rf` 都删不掉** —— 删除子目录需要父目录的写权限，而父目录已经是 1000 的了。`chmod` 被 proot 伪造（返回成功、mode 不变），`su browser` 也没用。
+
+**唯一补救**：`mv` 走（重命名只需要**父目录**的写权限，那个通常还有），再建个新的：
+
+```bash
+mv /home/container/browser-work /home/container/browser-work-poisoned
+mkdir -p /home/container/browser-work/{persistent,profiles,screenshots,task-results,downloaded_files,assets,archived_files}
+```
+
+那个 `-poisoned` 目录在 proot 里删不掉，去**翼龙面板的文件管理器**（在 proot 外面跑，能变成 uid 1000）删。
+
+**本包的处理**：`ins-ub24.sh` **默认跳过 chown**，而且 **`BROWSER_USER` 默认就是 `root`**。这些容器里面板本来就以 root 跑，chown 没有任何收益，只有风险。真要 chown 就设 `BP_CHOWN=1`（脚本会在 chown 后复测，变不可写会立刻告警并给出补救命令）。
+
+`browser-launcher.js` / 面板启动时**也会** chown 工作区 —— 这是另一个来源。所以 `BROWSER_USER=root` 很关键：`chown -R root:root` 对 `0:0` 的文件是 no-op，毒化就不会发生。如果发现工作区又变成 `1000:1000`，先查 `.env.panel` 里的 `BROWSER_USER`。
 
 ### 4. `panel.sh` 适配 Ubuntu
 
@@ -192,15 +205,59 @@ proot 里 systemd 会被 apt 顺带装进来然后炸。`ins-ub24.sh` 用 `apt-m
 
 ---
 
+### 7. apt 在 proot 下装不上包（Permission denied）
+
+**症状**：`apt install` 每个包都失败：
+
+```
+Could not open file /var/cache/apt/archives/partial/xxx.deb - open (13: Permission denied)
+```
+
+**根因**：`/var/cache/apt/archives/partial` 的真实属主是 uid **42（`_apt`）**、mode **700**。
+proot 里 `id` 报 `uid=0(root)` 是**假的**，真实 uid 不是 42，所以连"root"也进不去。
+而且 `chmod 777` 会被 proot **伪造**（返回成功、mode 不变 —— `ls -ldn` 一看还是 `drwx------`）。
+
+只设 `APT::Sandbox::User "root"` **不够** —— 问题在目录属主，不在 apt 以谁的身份跑。
+
+**修法**（`ins-ub24.sh` 已自动处理）：把下载缓存指到可写的新目录。
+
+```bash
+mkdir -p /var/cache/apt/archives2/partial
+echo 'Dir::Cache::archives "/var/cache/apt/archives2";' > /etc/apt/apt.conf.d/99proot-cache
+```
+
+**同一个套路还有**：nginx 装好后 `nginx -t` 报
+`open() "/var/log/nginx/error.log" failed (13: Permission denied)`
+—— 日志文件属主是 `www-data(33)` mode 640。目录本身可写，删掉重建即可：
+
+```bash
+rm -f /var/log/nginx/access.log /var/log/nginx/error.log
+touch /var/log/nginx/access.log /var/log/nginx/error.log
+```
+
+（之后 error.log 里的 `prctl(PR_SET_DUMPABLE) failed` 是 proot 无害噪音。）
+
 ## 使用步骤
 
 前提：已经在 proot Ubuntu 24.04 环境里（跑过 `toor.sh`）。
 
+> **⚠ 如果你要先跑自己的 `apt install`**（比如
+> `echo "127.0.0.1 localhost" > /etc/hosts && apt update && apt install curl wget nano sudo bash nginx -y`），
+> **先执行 `fix-apt.sh`** —— 否则会撞上下面「问题 7」那个缓存权限错误：
+>
+> ```bash
+> curl -o /root/fix-apt.sh -Ls https://raw.githubusercontent.com/<用户名>/<新仓库>/main/fix-apt.sh
+> bash /root/fix-apt.sh
+> ```
+>
+> `ins-ub24.sh` 里包含同样的修复（而且还会处理 `/etc/hosts`、装 `nano`/`sudo`/`nginx`），
+> 只是它跑得晚 —— 你的命令在它之前就失败了。
+
 ```bash
 # 1. 装依赖 + SeleniumBase 兼容层
 #    注意: shim/ 目录必须和 ins-ub24.sh 放一起(仓库里保持这个层级)
-curl -o /root/ins-ub24.sh -Ls https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/ins-ub24.sh
-curl -o /root/shim-seleniumbase.py -Ls https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/shim/seleniumbase/__init__.py
+curl -o /root/ins-ub24.sh -Ls https://raw.githubusercontent.com/<用户名>/<新仓库>/main/ins-ub24.sh
+curl -o /root/shim-seleniumbase.py -Ls https://raw.githubusercontent.com/<用户名>/<新仓库>/main/shim/seleniumbase/__init__.py
 mkdir -p /root/shim/seleniumbase && mv /root/shim-seleniumbase.py /root/shim/seleniumbase/__init__.py
 bash /root/ins-ub24.sh
 
@@ -210,11 +267,11 @@ bash /root/bp.sh
 
 # 3. 放 launcher（已内置 proot 补丁）
 mkdir -p /opt/browser-panel/server/runtime
-curl -fLs https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/browser-launcher.js \
+curl -fLs https://raw.githubusercontent.com/<用户名>/<新仓库>/main/browser-launcher.js \
   -o /opt/browser-panel/server/runtime/browser-launcher.js
 
 # 4. 启动
-curl -o /root/panel.sh -Ls https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/panel.sh
+curl -o /root/panel.sh -Ls https://raw.githubusercontent.com/<用户名>/<新仓库>/main/panel.sh
 sh /root/panel.sh
 sh /root/panel.sh status
 

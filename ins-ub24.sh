@@ -18,7 +18,7 @@ export DEBCONF_NONINTERACTIVE_SEEN=true
 APP="${PANEL_ROOT:-/opt/browser-panel}"
 ENV_FILE="${PANEL_ENV:-$APP/.env.panel}"
 
-BROWSER_USER="${BROWSER_USER:-browser}"
+BROWSER_USER="${BROWSER_USER:-root}"
 BROWSER_HOME="${BROWSER_HOME:-/home/$BROWSER_USER}"
 BROWSER_WORK="${BROWSER_WORK_DIR:-$BROWSER_HOME/browser-work}"
 CHROME_DIR="${CHROME_DIR:-/opt/chrome}"
@@ -58,12 +58,52 @@ rm -f /etc/apt/sources.list.d/nodesource.list \
 # ------------------------------------------------------------
 # 2. 基础包
 # ------------------------------------------------------------
+# proot 里 /etc/hosts 常常是空的, 会导致 localhost 解析失败(apt/pip/nginx 都可能受影响)。
+# 注意只补不覆盖: 有些环境里 /etc/hosts 还有 IPv6 之类的条目。
+if [ ! -s /etc/hosts ]; then
+  printf '127.0.0.1 localhost\n127.0.0.1 %s\n' "$(hostname 2>/dev/null || echo localhost)" > /etc/hosts
+  log "/etc/hosts 已创建 (127.0.0.1 localhost)"
+elif ! grep -q 'localhost' /etc/hosts 2>/dev/null; then
+  printf '127.0.0.1 localhost\n127.0.0.1 %s\n' "$(hostname 2>/dev/null || echo localhost)" >> /etc/hosts
+  log "/etc/hosts 补上了 localhost"
+fi
+
+# proot 陷阱: /var/cache/apt/archives/partial 的真实属主是 uid 42(_apt)、mode 700,
+# 而 proot 里 `id` 显示的 uid 0 是假的 —— 真实 uid 不是 42, 连 root 也写不进去,
+# 报 "Could not open file .../partial/xxx.deb - open (13: Permission denied)"。
+# 而且 chmod 在 proot 下会被伪造(返回成功、mode 不变), 硬改权限没用。
+# 对策: 把下载缓存整个指到可写的新目录。
+APT_CACHE_OK=1
+if ! touch /var/cache/apt/archives/partial/.wtest 2>/dev/null; then
+  APT_CACHE_OK=0
+fi
+rm -f /var/cache/apt/archives/partial/.wtest 2>/dev/null || true
+
+if [ "$APT_CACHE_OK" = "0" ]; then
+  warn "apt 下载缓存目录不可写, 重定向到 /var/cache/apt/archives2"
+  mkdir -p /var/cache/apt/archives2/partial
+  echo 'Dir::Cache::archives "/var/cache/apt/archives2";' \
+    > /etc/apt/apt.conf.d/99proot-cache
+  if touch /var/cache/apt/archives2/partial/.wtest 2>/dev/null; then
+    rm -f /var/cache/apt/archives2/partial/.wtest
+    log "apt 缓存已重定向, 且新目录实测可写"
+  else
+    die "新缓存目录也不可写, 请手动指定一个可写路径"
+  fi
+fi
+
+# apt 的 _apt 沙箱在 proot 下也会挡路(降权后写不进任何地方)
+if ! grep -rqs 'APT::Sandbox::User' /etc/apt/apt.conf.d/ 2>/dev/null; then
+  echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99proot-nosandbox
+  log "已关闭 apt 的 _apt 沙箱"
+fi
+
 log "2/8 apt update..."
 apt-get update -qq
 
 log "3/8 安装基础包..."
 apt-get install -y --no-install-recommends \
-    ca-certificates curl wget unzip xz-utils \
+    ca-certificates curl wget unzip xz-utils nano sudo \
     python3 python3-pip python3-dev python3-setuptools python3-wheel \
     build-essential procps \
     xvfb xauth xdotool \
@@ -95,8 +135,13 @@ else
   tmp="$(mktemp -d)"
   curl -fL --retry 5 --connect-timeout 20 -o "$tmp/node.tar.xz" \
     "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz"
-  tar -xJf "$tmp/node.tar.xz" -C "$tmp"
-  cp -r "$tmp/node-${NODE_VERSION}-linux-x64/." "$NODE_DIR/"
+  # 直接解到目标目录 —— 不要"先解压、再 cp"。
+  # node 的 tarball 顶层目录是 1000:1000 且 mode 700; tar 默认保留归档属主,
+  # proot 里真实 uid 不是 1000, 连读都读不了, cp 会报
+  #   cp: cannot stat '.../node-vXX-linux-x64/.': Permission denied
+  # --no-same-owner  让解出的文件归当前 uid
+  # --strip-components=1  跳过那个 700 的顶层目录
+  tar -xJf "$tmp/node.tar.xz" -C "$NODE_DIR" --strip-components=1 --no-same-owner
   chmod -R u+rwX,go+rX "$NODE_DIR"
   rm -rf "$tmp"
 fi
@@ -137,6 +182,19 @@ for f in "$APP/requirements-dp.txt" "$APP/requirements-sb.txt"; do
   [ -f "$f" ] && REQ="$REQ $f"
 done
 
+# 先看关键包是不是已经齐了。齐了就整段跳过 ——
+# 下面那条 pip 带 --ignore-installed，会强制重装全部依赖(几百 MB),
+# 在已经能正常跑的环境上重装不但白费时间, 中途失败还会把环境搞坏。
+# 实测踩过: 在已经跑通的面板上重跑安装, pip 这步是最大的风险来源。
+PY_STACK_OK=1
+for mod in DrissionPage selenium seleniumbase requests; do
+  python3 -c "import $mod" 2>/dev/null || PY_STACK_OK=0
+done
+
+if [ "$PY_STACK_OK" = "1" ] && [ "${BP_FORCE_PIP:-0}" != "1" ]; then
+  log "Python 自动化栈已就绪 (DrissionPage/selenium/seleniumbase/requests 均可导入), 跳过 pip"
+  log "  需要强制重装时: BP_FORCE_PIP=1 bash ins-ub24.sh"
+else
 python3 -m pip install \
   --break-system-packages --ignore-installed --disable-pip-version-check \
   --no-cache-dir \
@@ -145,7 +203,9 @@ python3 -m pip install \
   "DrissionPage>=4.1.0" "selenium>=4.20.0" "seleniumbase>=4.30.0" \
   "playwright>=1.40.0" \
   "pyrogram>=2.0.0" "TgCrypto>=1.2.0" \
-  "SpeechRecognition>=3.10.0" "pydub>=0.25.0" "numpy>=1.24.0"
+  "SpeechRecognition>=3.10.0" "pydub>=0.25.0" "numpy>=1.24.0" \
+  || warn "pip 安装失败 —— 如果之前装过, 可能仍然可用; 缺什么补什么"
+fi
 
 # ------------------------------------------------------------
 # 7.5 SeleniumBase 兼容层 —— proot 下 chromedriver 收到 /session 就 SIGSEGV
@@ -180,16 +240,72 @@ else
 fi
 
 # ------------------------------------------------------------
+# 6.7 nginx（可选；proot 下需要修日志文件属主）
+#     不需要就设 BP_NGINX=0 跳过
+# ------------------------------------------------------------
+if [ "${BP_NGINX:-1}" = "1" ]; then
+  log "6.7/8 安装 nginx..."
+  apt-get install -y nginx 2>/dev/null || warn "nginx 安装失败, 跳过"
+  if command -v nginx >/dev/null 2>&1; then
+    # proot 陷阱: nginx 的日志文件属主是 www-data(33)、mode 640,
+    # 伪造的 root 写不进去 -> `nginx -t` 报 open() error.log Permission denied。
+    # 目录本身可写, 删掉重建即可。
+    if ! touch /var/log/nginx/error.log 2>/dev/null; then
+      rm -f /var/log/nginx/access.log /var/log/nginx/error.log 2>/dev/null
+      touch /var/log/nginx/access.log /var/log/nginx/error.log 2>/dev/null
+      log "nginx 日志文件已重建（属主修正）"
+    fi
+    if nginx -t >/dev/null 2>&1; then
+      log "nginx 配置检查通过"
+    else
+      warn "nginx 配置检查未通过（通常是上面那个日志属主问题）"
+    fi
+  fi
+fi
+
+# ------------------------------------------------------------
 # 8. 工作区 —— 关键: 实测可写，不信权限位
 # ------------------------------------------------------------
 log "7/8 准备浏览器工作区..."
-mkdir -p "$APP/logs" "$APP/pids"
+mkdir -p "$APP/logs" "$APP/pids" 2>/dev/null || true
 
 if ! id "$BROWSER_USER" >/dev/null 2>&1; then
   useradd --create-home --home-dir "$BROWSER_HOME" --shell /bin/bash "$BROWSER_USER" 2>/dev/null || true
 fi
 
-mkdir -p "$BROWSER_WORK"/{persistent,profiles,screenshots,task-results,downloaded_files,assets,archived_files}
+# --- 挑一个真正可写的工作区 ---
+# 不能只信默认值: proot 里 /home/<user> 常被真实 uid 1000 拥有, 我们(伪造的 root)
+# 写不进去。而且 `set -e` 会让随后的 mkdir 直接终止脚本 —— 连下面的提示都看不到。
+# 所以先探测父目录, 再决定用哪个路径。
+probe_writable() {
+  _parent="$(dirname "$1")"
+  [ -d "$_parent" ] || return 1
+  if touch "$_parent/.bp_wtest" 2>/dev/null; then
+    rm -f "$_parent/.bp_wtest" 2>/dev/null
+    return 0
+  fi
+  return 1
+}
+
+CHOSEN_WORK=""
+for cand in "$BROWSER_WORK" /home/container/browser-work "$APP/browser-work" /root/browser-work /tmp/browser-work; do
+  if probe_writable "$cand"; then
+    CHOSEN_WORK="$cand"
+    break
+  fi
+done
+
+[ -n "$CHOSEN_WORK" ] || die "找不到可写的工作区, 请手动指定 BROWSER_WORK_DIR=/可写路径"
+
+if [ "$CHOSEN_WORK" != "$BROWSER_WORK" ]; then
+  warn "默认工作区不可写: $BROWSER_WORK"
+  warn "  已自动改用:   $CHOSEN_WORK"
+  BROWSER_WORK="$CHOSEN_WORK"
+  BROWSER_HOME="$(dirname "$BROWSER_WORK")"
+  BROWSER_USER_DATA_DIR="$BROWSER_WORK/persistent"
+fi
+
+mkdir -p "$BROWSER_WORK"/{persistent,profiles,screenshots,task-results,downloaded_files,assets,archived_files} 2>/dev/null || true
 
 WRITABLE=0
 if touch "$BROWSER_WORK/.wtest" 2>/dev/null; then
@@ -199,14 +315,22 @@ fi
 
 if [ "$WRITABLE" = "1" ]; then
   log "工作区可写: $BROWSER_WORK"
-  # proot 下 chown 可能把目录永久锁死，所以只在能安全操作时做
-  chown -R "$BROWSER_USER:$BROWSER_USER" "$BROWSER_WORK" 2>/dev/null \
-    && log "已 chown 给 $BROWSER_USER" \
-    || warn "chown 失败（proot 下常见），保持当前属主"
-  if ! touch "$BROWSER_WORK/.wtest" 2>/dev/null; then
-    rm -f "$BROWSER_WORK/.wtest" 2>/dev/null
-    warn "⚠ chown 之后工作区反而不可写了 —— 这是 proot 的 uid 映射问题"
-    warn "  改用 BROWSER_USER=root 重跑本脚本即可（见 README 问题 3）"
+  # ⚠ proot 下**绝对不要** chown。
+  # chown 之后目录属主变成真实 uid 1000(browser)，而 proot 里伪造的 root 不是 1000
+  # —— 工作区会**永久不可写**：连 rm -rf 都删不掉(删除需要父目录写权限)，
+  # 只能靠 `mv <dir> <dir>-poisoned` 挪走再重建。实测踩过，见 README 问题 3。
+  # 这些容器里面板本来就以 root 跑，chown 没有任何收益。需要时设 BP_CHOWN=1 强制。
+  if [ "${BP_CHOWN:-0}" = "1" ]; then
+    chown -R "$BROWSER_USER:$BROWSER_USER" "$BROWSER_WORK" 2>/dev/null \
+      && log "已 chown 给 $BROWSER_USER (BP_CHOWN=1)" \
+      || warn "chown 失败，保持当前属主"
+    if ! touch "$BROWSER_WORK/.wtest" 2>/dev/null; then
+      rm -f "$BROWSER_WORK/.wtest" 2>/dev/null
+      warn "⚠ chown 之后工作区不可写了 —— 这就是 proot 的 uid 映射问题"
+      warn "  补救: mv $BROWSER_WORK ${BROWSER_WORK}-poisoned && mkdir -p $BROWSER_WORK"
+    fi
+  else
+    log "跳过 chown（proot 安全默认；需要时 BP_CHOWN=1）"
   fi
 else
   warn "⚠ 工作区不可写: $BROWSER_WORK"
@@ -239,7 +363,7 @@ BROWSER_HOME=$BROWSER_HOME
 BROWSER_WORK_DIR=$BROWSER_WORK
 BROWSER_XAUTHORITY=$XAUTH
 BROWSER_USER_DATA_DIR=$BROWSER_WORK/persistent
-# SeleniumBase 兼容层: 让 `from seleniumbase import SB` 走 DrissionPage 后端
+# SeleniumBase 兼容层: 让 seleniumbase.SB 走 DrissionPage 后端
 # (proot 下 chromedriver 会 SIGSEGV, 详见 README「0. Chrome 脚本跑不起来」)
 PYTHONPATH=$APP/shim:$APP/shim/pylibs
 # PRoot: 让 browser-launcher.js 跳过降权（该补丁已内置在 launcher 里）
