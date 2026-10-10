@@ -100,7 +100,7 @@ proot 里 systemd 会被 apt 顺带装进来然后炸。`ins-ub24.sh` 用 `apt-m
 
 ```bash
 # 1. 装依赖
-curl -o /root/ins-ub24.sh -Ls https://raw.githubusercontent.com/<用户名>/<新仓库>/main/ins-ub24.sh
+curl -o /root/ins-ub24.sh -Ls https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/ins-ub24.sh
 bash /root/ins-ub24.sh
 
 # 2. 装面板（用你 proot-ub24 里那份原版 bp.sh 即可）
@@ -109,11 +109,11 @@ bash /root/bp.sh
 
 # 3. 放 launcher（已内置 proot 补丁）
 mkdir -p /opt/browser-panel/server/runtime
-curl -fLs https://raw.githubusercontent.com/<用户名>/<新仓库>/main/browser-launcher.js \
+curl -fLs https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/browser-launcher.js \
   -o /opt/browser-panel/server/runtime/browser-launcher.js
 
 # 4. 启动
-curl -o /root/panel.sh -Ls https://raw.githubusercontent.com/<用户名>/<新仓库>/main/panel.sh
+curl -o /root/panel.sh -Ls https://raw.githubusercontent.com/kof99zip/proot-ub24-mod/main/panel.sh
 sh /root/panel.sh
 sh /root/panel.sh status
 ```
