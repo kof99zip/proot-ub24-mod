@@ -1,74 +1,21 @@
-#!/bin/bash
+#!/bin/sh
+# ============================================================
+# browser-panel 启动器（容器/proot 环境）
+#
+# 为什么必须有这个脚本:
+#
+# config.js 通过 process.env 读取 BROWSER_WORK_DIR / BROWSER_HOME 等变量,
+# 读不到就退回 /home/<user>/browser-work。但在容器里 /home 是只读 overlay,
+# 直接 `node server/index.js` 会退回只读路径并报 EACCES。
+#
+# 所以必须先 source .env.panel 把变量灌进环境, 再启动 node。
+# systemd 能干这事(EnvironmentFile=), 但容器里通常没有 systemd。
+# ============================================================
 
-APP=/opt/browser-panel
+cd /opt/browser-panel || exit 1
 
-NODE=/opt/node22/bin/node
-FIREFOX=/opt/ruyipage-firefox/firefox
-CHROME=/usr/bin/chromium-browser
+set -a
+[ -f .env.panel ] && . ./.env.panel
+set +a
 
-echo "[BP] stopping old processes..."
-
-pkill -f '[X]vfb :1' 2>/dev/null || true
-pkill -f 'server/index.js' 2>/dev/null || true
-
-
-sleep 2
-
-
-echo "[BP] starting Xvfb..."
-
-
-/usr/bin/Xvfb :1 \
--screen 0 1440x900x24 \
--ac \
-+extension GLX \
-+render \
--noreset \
->>$APP/logs/xvfb.log 2>&1 &
-
-
-XVFB_PID=$!
-
-
-echo $XVFB_PID > $APP/pids/xvfb.pid
-
-
-sleep 2
-
-
-
-echo "[BP] starting panel..."
-
-
-cd $APP
-
-
-export NODE_ENV=production
-
-export DISPLAY=:1.0
-
-export BROWSER_CHROME_PATH=$CHROME
-
-export PLAYWRIGHT_CHROME_PATH=$CHROME
-
-export RUYIPAGE_FIREFOX_PATH=$FIREFOX
-
-nohup $NODE server/index.js \
->>$APP/logs/panel.log 2>&1 &
-
-
-
-PID=$!
-
-
-echo $PID > $APP/pids/panel.pid
-
-
-
-echo "[BP] started"
-
-echo "Xvfb PID: $XVFB_PID"
-
-echo "Panel PID: $PID"
-
-echo "http://0.0.0.0:3210"
+exec node server/index.js
